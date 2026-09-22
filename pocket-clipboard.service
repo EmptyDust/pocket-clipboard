@@ -1,0 +1,16 @@
+[Unit]
+Description=Pocket Clipboard photo relay
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/apps/pocket-clipboard
+ExecStart=/usr/bin/node /root/apps/pocket-clipboard/server.mjs
+Environment=PORT=8787
+EnvironmentFile=-/root/apps/pocket-clipboard/.env
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
