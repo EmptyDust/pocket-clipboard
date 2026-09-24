@@ -1,5 +1,5 @@
 plugins { id 'com.android.application' }
 
 android { namespace 'com.emptydust.pocketclipboard'; compileSdk 35
-    defaultConfig { applicationId 'com.emptydust.pocketclipboard'; minSdk 26; targetSdk 35; versionCode 3; versionName '1.0.2' }
+    defaultConfig { applicationId 'com.emptydust.pocketclipboard'; minSdk 26; targetSdk 35; versionCode 4; versionName '1.0.3' }
 }
