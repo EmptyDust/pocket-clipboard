@@ -21,6 +21,7 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.Switch;
 import android.widget.TextView;
 
 import java.io.ByteArrayOutputStream;
@@ -28,9 +29,12 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import org.json.JSONObject;
 import java.security.KeyStore;
 import java.util.Base64;
+import java.util.Locale;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
@@ -43,9 +47,12 @@ public class MainActivity extends Activity {
     private static final int GALLERY_PERMISSION_REQUEST = 44;
     private EditText codeInput;
     private EditText tokenInput;
+    private Switch saveLocalSwitch;
     private TextView status;
     private ImageView preview;
     private Uri photoUri;
+    private boolean deleteCapturedPhotoAfterSend;
+    private boolean capturedPhotoPending;
     private SharedPreferences preferences;
 
     @Override public void onCreate(Bundle state) {
@@ -73,6 +80,9 @@ public class MainActivity extends Activity {
         tokenInput = new EditText(this); tokenInput.setHint("可选：7bu Token（仅本机加密保存）"); tokenInput.setSingleLine(); tokenInput.setTextSize(14); tokenInput.setInputType(0x81); tokenInput.setText(loadToken()); tokenInput.setOnFocusChangeListener((view, focused) -> { if (!focused) saveToken(); });
         LinearLayout.LayoutParams tokenParams = new LinearLayout.LayoutParams(-1, dp(48)); tokenParams.topMargin = dp(10); root.addView(tokenInput, tokenParams);
 
+        saveLocalSwitch = new Switch(this); saveLocalSwitch.setText("保存拍摄原图到手机相册"); saveLocalSwitch.setTextSize(14); saveLocalSwitch.setChecked(preferences.getBoolean("save_local_photo", true)); saveLocalSwitch.setOnCheckedChangeListener((button, checked) -> preferences.edit().putBoolean("save_local_photo", checked).apply());
+        LinearLayout.LayoutParams saveParams = new LinearLayout.LayoutParams(-1, dp(44)); saveParams.topMargin = dp(4); root.addView(saveLocalSwitch, saveParams);
+
         LinearLayout actions = new LinearLayout(this); actions.setOrientation(LinearLayout.HORIZONTAL); actions.setGravity(Gravity.CENTER); actions.setWeightSum(2);
         Button camera = new Button(this); camera.setText("拍照并发送"); camera.setTextSize(16); camera.setOnClickListener(v -> takePhoto());
         Button gallery = new Button(this); gallery.setText("从相册选择"); gallery.setTextSize(16); gallery.setOnClickListener(v -> choosePhoto());
@@ -91,14 +101,21 @@ public class MainActivity extends Activity {
         if (!code.matches("\\d{6}")) { status.setText("请输入六位数字配对码"); return; }
         saveCode();
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) { requestPermissions(new String[]{Manifest.permission.CAMERA}, CAMERA_REQUEST); return; }
-        ContentValues values = new ContentValues(); values.put(MediaStore.Images.Media.DISPLAY_NAME, "pocket-clipboard.jpg"); values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg"); values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/PocketClipboard");
+        boolean saveLocal = saveLocalSwitch.isChecked();
+        deleteCapturedPhotoAfterSend = !saveLocal;
+        preferences.edit().putBoolean("save_local_photo", saveLocal).apply();
+        ContentValues values = new ContentValues(); values.put(MediaStore.Images.Media.DISPLAY_NAME, "PocketClipboard_" + timestamp() + ".jpg"); values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+        if (Build.VERSION.SDK_INT >= 29) { values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/PocketClipboard"); values.put(MediaStore.Images.Media.IS_PENDING, 1); }
         photoUri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+        if (photoUri == null) { status.setText("无法创建照片文件"); return; }
+        capturedPhotoPending = true;
         Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE); intent.putExtra(MediaStore.EXTRA_OUTPUT, photoUri); startActivityForResult(intent, CAMERA_REQUEST);
     }
 
     private void choosePhoto() {
         String code = codeInput.getText().toString().trim();
         if (!code.matches("\\d{6}")) { status.setText("请输入六位数字配对码"); return; }
+        deleteCapturedPhotoAfterSend = false;
         saveCode();
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.READ_MEDIA_IMAGES) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.READ_MEDIA_IMAGES}, GALLERY_PERMISSION_REQUEST); return;
@@ -123,12 +140,20 @@ public class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == CAMERA_REQUEST && result != RESULT_OK) { deleteCapturedPhoto(); return; }
         if (request == GALLERY_REQUEST && result == RESULT_OK && data != null && data.getData() != null) photoUri = data.getData();
         if ((request != CAMERA_REQUEST && request != GALLERY_REQUEST) || result != RESULT_OK || photoUri == null) return;
+        if (request == CAMERA_REQUEST && saveLocalSwitch.isChecked()) publishCapturedPhoto();
         status.setText("正在压缩并发送…");
         saveToken();
-        new Thread(() -> { try { byte[] bytes = compressPhoto(); String hostedStatus = upload(bytes); runOnUiThread(() -> { status.setText(uploadStatusText(hostedStatus)); preview.setImageURI(photoUri); }); } catch (Exception e) { runOnUiThread(() -> status.setText("发送失败：" + e.getMessage())); } }).start();
+        new Thread(() -> { try { byte[] bytes = compressPhoto(); String hostedStatus = upload(bytes); runOnUiThread(() -> { status.setText(uploadStatusText(hostedStatus)); preview.setImageURI(photoUri); deleteCapturedPhoto(); }); } catch (Exception e) { deleteCapturedPhoto(); runOnUiThread(() -> status.setText("发送失败：" + e.getMessage())); } }).start();
     }
+
+    private String timestamp() { return new SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(new Date()); }
+
+    private void publishCapturedPhoto() { if (Build.VERSION.SDK_INT >= 29 && photoUri != null) { ContentValues values = new ContentValues(); values.put(MediaStore.Images.Media.IS_PENDING, 0); getContentResolver().update(photoUri, values, null, null); } capturedPhotoPending = false; }
+
+    private void deleteCapturedPhoto() { if (photoUri != null && (capturedPhotoPending || deleteCapturedPhotoAfterSend)) { getContentResolver().delete(photoUri, null, null); photoUri = null; capturedPhotoPending = false; deleteCapturedPhotoAfterSend = false; } }
 
     private byte[] compressPhoto() throws Exception {
         Bitmap source; try (InputStream input = getContentResolver().openInputStream(photoUri)) { source = BitmapFactory.decodeStream(input); }
