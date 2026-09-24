@@ -3,7 +3,9 @@ package com.emptydust.pocketclipboard;
 import android.Manifest;
 import android.app.Activity;
 import android.content.ContentValues;
+import android.content.ClipData;
 import android.content.Intent;
+import android.content.pm.ResolveInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -105,11 +107,27 @@ public class MainActivity extends Activity {
         deleteCapturedPhotoAfterSend = !saveLocal;
         preferences.edit().putBoolean("save_local_photo", saveLocal).apply();
         ContentValues values = new ContentValues(); values.put(MediaStore.Images.Media.DISPLAY_NAME, "PocketClipboard_" + timestamp() + ".jpg"); values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
-        if (Build.VERSION.SDK_INT >= 29) { values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/PocketClipboard"); values.put(MediaStore.Images.Media.IS_PENDING, 1); }
+        if (Build.VERSION.SDK_INT >= 29) values.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/PocketClipboard");
         photoUri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
         if (photoUri == null) { status.setText("无法创建照片文件"); return; }
-        capturedPhotoPending = true;
-        Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE); intent.putExtra(MediaStore.EXTRA_OUTPUT, photoUri); startActivityForResult(intent, CAMERA_REQUEST);
+        // The camera is a separate app. A pending MediaStore item can be unreadable to it,
+        // so make the output URI visible and explicitly grant it read/write access.
+        capturedPhotoPending = false;
+        status.setText("正在打开相机…");
+        Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+        intent.putExtra(MediaStore.EXTRA_OUTPUT, photoUri);
+        intent.setClipData(ClipData.newRawUri("Pocket Clipboard photo", photoUri));
+        int uriPermissions = Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+        intent.addFlags(uriPermissions);
+        for (ResolveInfo handler : getPackageManager().queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY)) {
+            grantUriPermission(handler.activityInfo.packageName, photoUri, uriPermissions);
+        }
+        try {
+            startActivityForResult(intent, CAMERA_REQUEST);
+        } catch (Exception error) {
+            deleteCapturedPhoto();
+            status.setText("无法打开相机：" + error.getMessage());
+        }
     }
 
     private void choosePhoto() {
@@ -140,11 +158,11 @@ public class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
-        if (request == CAMERA_REQUEST && result != RESULT_OK) { deleteCapturedPhoto(); return; }
+        if (request == CAMERA_REQUEST && result != RESULT_OK) { deleteCapturedPhoto(); status.setText("拍照已取消"); return; }
         if (request == GALLERY_REQUEST && result == RESULT_OK && data != null && data.getData() != null) photoUri = data.getData();
         if ((request != CAMERA_REQUEST && request != GALLERY_REQUEST) || result != RESULT_OK || photoUri == null) return;
         if (request == CAMERA_REQUEST && saveLocalSwitch.isChecked()) publishCapturedPhoto();
-        status.setText("正在压缩并发送…");
+        status.setText(request == CAMERA_REQUEST ? "正在读取照片并发送…" : "正在压缩并发送…");
         saveToken();
         new Thread(() -> { try { byte[] bytes = compressPhoto(); String hostedStatus = upload(bytes); runOnUiThread(() -> { status.setText(uploadStatusText(hostedStatus)); preview.setImageURI(photoUri); deleteCapturedPhoto(); }); } catch (Exception e) { deleteCapturedPhoto(); runOnUiThread(() -> status.setText("发送失败：" + e.getMessage())); } }).start();
     }
