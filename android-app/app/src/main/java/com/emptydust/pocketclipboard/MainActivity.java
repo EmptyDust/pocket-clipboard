@@ -37,6 +37,8 @@ import org.json.JSONObject;
 import java.security.KeyStore;
 import java.util.Base64;
 import java.util.Locale;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
@@ -54,13 +56,24 @@ public class MainActivity extends Activity {
     private ImageView preview;
     private Uri photoUri;
     private boolean deleteCapturedPhotoAfterSend;
-    private boolean capturedPhotoPending;
     private SharedPreferences preferences;
+    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private volatile HttpURLConnection activeConnection;
+    private volatile boolean destroyed;
+    private boolean sending;
+    private Button cameraButton;
+    private Button galleryButton;
+    private Bitmap previewBitmap;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         preferences = getSharedPreferences("pocket_clipboard", MODE_PRIVATE);
         buildUi();
+        if (state != null) {
+            String savedUri = state.getString("photo_uri");
+            photoUri = savedUri == null ? null : Uri.parse(savedUri);
+            deleteCapturedPhotoAfterSend = state.getBoolean("delete_photo");
+        }
     }
 
     private void buildUi() {
@@ -86,8 +99,8 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams saveParams = new LinearLayout.LayoutParams(-1, dp(44)); saveParams.topMargin = dp(4); root.addView(saveLocalSwitch, saveParams);
 
         LinearLayout actions = new LinearLayout(this); actions.setOrientation(LinearLayout.HORIZONTAL); actions.setGravity(Gravity.CENTER); actions.setWeightSum(2);
-        Button camera = new Button(this); camera.setText("拍照并发送"); camera.setTextSize(16); camera.setOnClickListener(v -> takePhoto());
-        Button gallery = new Button(this); gallery.setText("从相册选择"); gallery.setTextSize(16); gallery.setOnClickListener(v -> choosePhoto());
+        Button camera = new Button(this); cameraButton = camera; camera.setText("拍照并发送"); camera.setTextSize(16); camera.setOnClickListener(v -> takePhoto());
+        Button gallery = new Button(this); galleryButton = gallery; gallery.setText("从相册选择"); gallery.setTextSize(16); gallery.setOnClickListener(v -> choosePhoto());
         actions.addView(camera, new LinearLayout.LayoutParams(0, dp(58), 1)); actions.addView(gallery, new LinearLayout.LayoutParams(0, dp(58), 1));
         LinearLayout.LayoutParams buttonParams = new LinearLayout.LayoutParams(-1, dp(58)); buttonParams.topMargin = dp(16); root.addView(actions, buttonParams);
 
@@ -99,6 +112,7 @@ public class MainActivity extends Activity {
     }
 
     private void takePhoto() {
+        if (sending) return;
         String code = codeInput.getText().toString().trim();
         if (!code.matches("\\d{6}")) { status.setText("请输入六位数字配对码"); return; }
         saveCode();
@@ -112,7 +126,6 @@ public class MainActivity extends Activity {
         if (photoUri == null) { status.setText("无法创建照片文件"); return; }
         // The camera is a separate app. A pending MediaStore item can be unreadable to it,
         // so make the output URI visible and explicitly grant it read/write access.
-        capturedPhotoPending = false;
         status.setText("正在打开相机…");
         Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
         intent.putExtra(MediaStore.EXTRA_OUTPUT, photoUri);
@@ -125,12 +138,13 @@ public class MainActivity extends Activity {
         try {
             startActivityForResult(intent, CAMERA_REQUEST);
         } catch (Exception error) {
-            deleteCapturedPhoto();
+            cleanupPhoto(photoUri, true); photoUri = null;
             status.setText("无法打开相机：" + error.getMessage());
         }
     }
 
     private void choosePhoto() {
+        if (sending) return;
         String code = codeInput.getText().toString().trim();
         if (!code.matches("\\d{6}")) { status.setText("请输入六位数字配对码"); return; }
         deleteCapturedPhotoAfterSend = false;
@@ -158,38 +172,125 @@ public class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
-        if (request == CAMERA_REQUEST && result != RESULT_OK) { deleteCapturedPhoto(); status.setText("拍照已取消"); return; }
+        if (request == CAMERA_REQUEST && result != RESULT_OK) { cleanupPhoto(photoUri, true); photoUri = null; status.setText("拍照已取消"); return; }
         if (request == GALLERY_REQUEST && result == RESULT_OK && data != null && data.getData() != null) photoUri = data.getData();
         if ((request != CAMERA_REQUEST && request != GALLERY_REQUEST) || result != RESULT_OK || photoUri == null) return;
         if (request == CAMERA_REQUEST && saveLocalSwitch.isChecked()) publishCapturedPhoto();
         status.setText(request == CAMERA_REQUEST ? "正在读取照片并发送…" : "正在压缩并发送…");
         saveToken();
-        new Thread(() -> { try { byte[] bytes = compressPhoto(); String hostedStatus = upload(bytes); runOnUiThread(() -> { status.setText(uploadStatusText(hostedStatus)); preview.setImageURI(photoUri); deleteCapturedPhoto(); }); } catch (Exception e) { deleteCapturedPhoto(); runOnUiThread(() -> status.setText("发送失败：" + e.getMessage())); } }).start();
+        if (sending) return;
+        final Uri selectedUri = photoUri;
+        final boolean deleteAfterSend = request == CAMERA_REQUEST && deleteCapturedPhotoAfterSend;
+        final String code = codeInput.getText().toString().trim();
+        final String token = loadToken();
+        setSending(true);
+        worker.execute(() -> {
+            Bitmap thumbnail = null;
+            try {
+                byte[] bytes = compressPhoto(selectedUri);
+                if (Thread.currentThread().isInterrupted() || destroyed) return;
+                BitmapFactory.Options previewOptions = new BitmapFactory.Options();
+                previewOptions.inSampleSize = 4;
+                thumbnail = BitmapFactory.decodeByteArray(bytes, 0, bytes.length, previewOptions);
+                String hostedStatus = upload(bytes, code, token);
+                final Bitmap readyPreview = thumbnail;
+                thumbnail = null;
+                runOnUiThread(() -> {
+                    if (destroyed) { if (readyPreview != null) readyPreview.recycle(); return; }
+                    status.setText(uploadStatusText(hostedStatus));
+                    preview.setImageBitmap(readyPreview);
+                    if (previewBitmap != null) previewBitmap.recycle();
+                    previewBitmap = readyPreview;
+                });
+            } catch (Exception error) {
+                runOnUiThread(() -> { if (!destroyed) status.setText("发送失败：" + error.getMessage()); });
+            } finally {
+                if (thumbnail != null) thumbnail.recycle();
+                cleanupPhoto(selectedUri, deleteAfterSend);
+                runOnUiThread(() -> { if (!destroyed) { photoUri = null; setSending(false); } });
+            }
+        });
+    }
+
+    @Override protected void onSaveInstanceState(Bundle state) {
+        super.onSaveInstanceState(state);
+        if (photoUri != null) state.putString("photo_uri", photoUri.toString());
+        state.putBoolean("delete_photo", deleteCapturedPhotoAfterSend);
+    }
+
+    @Override protected void onDestroy() {
+        destroyed = true;
+        worker.shutdownNow();
+        HttpURLConnection connection = activeConnection;
+        if (connection != null) connection.disconnect();
+        preview.setImageDrawable(null);
+        if (previewBitmap != null) previewBitmap.recycle();
+        super.onDestroy();
+    }
+
+    private void setSending(boolean value) {
+        sending = value;
+        cameraButton.setEnabled(!value); galleryButton.setEnabled(!value);
+        codeInput.setEnabled(!value); tokenInput.setEnabled(!value); saveLocalSwitch.setEnabled(!value);
     }
 
     private String timestamp() { return new SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(new Date()); }
 
-    private void publishCapturedPhoto() { if (Build.VERSION.SDK_INT >= 29 && photoUri != null) { ContentValues values = new ContentValues(); values.put(MediaStore.Images.Media.IS_PENDING, 0); getContentResolver().update(photoUri, values, null, null); } capturedPhotoPending = false; }
+    private void publishCapturedPhoto() { if (Build.VERSION.SDK_INT >= 29 && photoUri != null) { ContentValues values = new ContentValues(); values.put(MediaStore.Images.Media.IS_PENDING, 0); getContentResolver().update(photoUri, values, null, null); } }
 
-    private void deleteCapturedPhoto() { if (photoUri != null && (capturedPhotoPending || deleteCapturedPhotoAfterSend)) { getContentResolver().delete(photoUri, null, null); photoUri = null; capturedPhotoPending = false; deleteCapturedPhotoAfterSend = false; } }
-
-    private byte[] compressPhoto() throws Exception {
-        Bitmap source; try (InputStream input = getContentResolver().openInputStream(photoUri)) { source = BitmapFactory.decodeStream(input); }
-        if (source == null) throw new Exception("无法读取照片");
-        int max = 2200; float scale = Math.min(1f, max / (float)Math.max(source.getWidth(), source.getHeight()));
-        Bitmap scaled = Bitmap.createScaledBitmap(source, Math.max(1, Math.round(source.getWidth() * scale)), Math.max(1, Math.round(source.getHeight() * scale)), true);
-        ByteArrayOutputStream output = new ByteArrayOutputStream(); scaled.compress(Bitmap.CompressFormat.JPEG, 82, output); source.recycle(); if (scaled != source) scaled.recycle(); return output.toByteArray();
+    private void cleanupPhoto(Uri uri, boolean delete) {
+        if (uri == null || !delete) return;
+        try { getContentResolver().delete(uri, null, null); } catch (Exception ignored) { }
     }
 
-    private String upload(byte[] bytes) throws Exception {
-        String code = codeInput.getText().toString().trim(); URL url = new URL(API_BASE + "/api/room/" + code + "/image"); HttpURLConnection connection = (HttpURLConnection) url.openConnection(); connection.setRequestMethod("POST"); connection.setDoOutput(true); connection.setConnectTimeout(15000); connection.setReadTimeout(30000); connection.setRequestProperty("Content-Type", "image/jpeg"); String token = loadToken(); if (!token.isEmpty()) connection.setRequestProperty("X-Sevenbu-Token", token); connection.setFixedLengthStreamingMode(bytes.length);
-        try (OutputStream output = connection.getOutputStream()) { output.write(bytes); }
-        int response = connection.getResponseCode();
-        InputStream input = response >= 200 && response < 300 ? connection.getInputStream() : connection.getErrorStream();
-        ByteArrayOutputStream body = new ByteArrayOutputStream(); if (input != null) { byte[] buffer = new byte[1024]; int count; while ((count = input.read(buffer)) != -1) body.write(buffer, 0, count); input.close(); }
-        if (response < 200 || response >= 300) throw new Exception("服务器返回 " + response);
-        String hostedStatus = "disabled"; try { hostedStatus = new JSONObject(body.toString("UTF-8")).optString("hostedStatus", hostedStatus); } catch (Exception ignored) { }
-        connection.disconnect(); return hostedStatus;
+    private byte[] compressPhoto(Uri uri) throws Exception {
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        try (InputStream input = getContentResolver().openInputStream(uri)) { BitmapFactory.decodeStream(input, null, bounds); }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) throw new Exception("无法读取照片");
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inSampleSize = 1;
+        while (Math.max(bounds.outWidth, bounds.outHeight) / options.inSampleSize > 2200) options.inSampleSize *= 2;
+        Bitmap source;
+        try (InputStream input = getContentResolver().openInputStream(uri)) { source = BitmapFactory.decodeStream(input, null, options); }
+        if (source == null) throw new Exception("无法读取照片");
+        try {
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            if (!source.compress(Bitmap.CompressFormat.JPEG, 82, output)) throw new Exception("无法压缩照片");
+            byte[] bytes = output.toByteArray();
+            if (bytes.length > 8 * 1024 * 1024) throw new Exception("压缩后图片超过 8 MB");
+            return bytes;
+        } finally { source.recycle(); }
+    }
+
+    private String upload(byte[] bytes, String code, String token) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(API_BASE + "/api/room/" + code + "/image").openConnection();
+        activeConnection = connection;
+        try {
+            if (destroyed || Thread.currentThread().isInterrupted()) throw new Exception("发送已取消");
+            connection.setRequestMethod("POST"); connection.setDoOutput(true);
+            connection.setConnectTimeout(15000); connection.setReadTimeout(30000);
+            connection.setRequestProperty("Content-Type", "image/jpeg");
+            if (!token.isEmpty()) connection.setRequestProperty("X-Sevenbu-Token", token);
+            connection.setFixedLengthStreamingMode(bytes.length);
+            try (OutputStream output = connection.getOutputStream()) { output.write(bytes); }
+            int response = connection.getResponseCode();
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            try (InputStream input = response >= 200 && response < 300 ? connection.getInputStream() : connection.getErrorStream()) {
+                if (input != null) {
+                    byte[] buffer = new byte[1024]; int count;
+                    while ((count = input.read(buffer)) != -1) {
+                        if (body.size() + count > 65536) throw new Exception("服务器响应过大");
+                        body.write(buffer, 0, count);
+                    }
+                }
+            }
+            if (response < 200 || response >= 300) throw new Exception("服务器返回 " + response);
+            return new JSONObject(body.toString("UTF-8")).optString("hostedStatus", "disabled");
+        } finally {
+            connection.disconnect();
+            activeConnection = null;
+        }
     }
 
     private String uploadStatusText(String hostedStatus) {

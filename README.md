@@ -27,3 +27,16 @@ Application packages are published in the [Releases](../../releases) section rat
 ## Security
 
 Do not commit real 7bu tokens, server environment files, Android `local.properties`, or signing keys. The relay accepts a per-upload `X-Sevenbu-Token` header from the Android client over HTTPS and never sends that token to the macOS receiver.
+
+## 1.0.4 performance fixes
+
+The receiver polls small metadata with ETag validation and downloads each new image once. Image decoding runs off the UI thread; network and image failures back off, and refreshed pairing sessions cancel stale requests. Quitting the macOS app does not trigger an automatic restart; login startup remains configurable through the existing LaunchAgent.
+
+Android samples images before allocating pixels, builds a small preview in its worker, and permits only one upload at a time. The relay expires image data independently of polling, limits retained buffers and concurrent work, and streams downloads with backpressure. See [API limits](docs/api.md) and [the issue list](docs/performance-2026-10-16.md).
+
+Run relay regressions with `npm test`. On macOS, run receiver regressions with:
+
+```sh
+swiftc mac-app/RelayClient.swift tests/mac-receiver/main.swift -framework Cocoa -o /tmp/pocket-receiver-tests
+/tmp/pocket-receiver-tests
+```

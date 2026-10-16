@@ -1,10 +1,6 @@
 import Cocoa
 import UserNotifications
 
-private struct SessionResponse: Decodable { let code: String }
-private struct ImagePayload: Decodable { let mime: String; let data: String; let size: Int; let at: Int64; let hostedStatus: String?; let hostedUrl: String?; let hostedError: String? }
-private struct LatestResponse: Decodable { let image: ImagePayload? }
-
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let origin = "https://hw.emptydust.com/pocket"
     var code = ""
@@ -13,9 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var latestHostedStatus: String?
     private var statusItem: NSStatusItem!
     private var window: NSWindow?
-    private var timer: Timer?
-    private var lastImageAt: Int64 = 0
-    private var requestInFlight = false
+    private lazy var receiver = RelayClient(origin: origin)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -24,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = makeMenu()
         NSApp.mainMenu = makeApplicationMenu()
         requestNotificationPermission()
+        configureReceiver()
         createSession()
         enableLaunchAtLogin()
     }
@@ -33,7 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    func applicationWillTerminate(_ notification: Notification) { timer?.invalidate() }
+    func applicationWillTerminate(_ notification: Notification) { receiver.stop() }
 
     private func makeMenu() -> NSMenu {
         let menu = NSMenu()
@@ -71,6 +66,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateMenu() {
+        (window?.contentView as? ReceiverView)?.refresh()
         guard let items = statusItem.menu?.items else { return }
         items.first(where: { $0.tag == 1 })?.title = code.isEmpty ? "配对码：生成中…" : "配对码：\(code)"
         items.first(where: { $0.tag == 2 })?.title = currentStatus
@@ -95,60 +91,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc private func quit() { NSApp.terminate(nil) }
 
+    private func configureReceiver() {
+        receiver.onSession = { [weak self] code in
+            guard let self else { return }
+            self.code = code; self.updateMenu(); self.showWindow()
+        }
+        receiver.onStatus = { [weak self] status in
+            self?.currentStatus = status; self?.updateMenu()
+        }
+        receiver.onImage = { [weak self] image, png in
+            guard let self else { return false }
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            guard pasteboard.setData(png, forType: .png) else { return false }
+            self.latestHostedUrl = image.hostedUrl
+            self.latestHostedStatus = image.hostedStatus
+            self.currentStatus = self.statusText(for: image); self.updateMenu()
+            self.sendNotification(size: image.size)
+            return true
+        }
+        receiver.onMetadata = { [weak self] image in
+            guard let self, image.hostedStatus != self.latestHostedStatus || image.hostedUrl != self.latestHostedUrl else { return }
+            self.latestHostedStatus = image.hostedStatus
+            self.latestHostedUrl = image.hostedUrl
+            self.currentStatus = self.statusText(for: image); self.updateMenu()
+        }
+    }
+
     private func createSession() {
-        timer?.invalidate()
         code = ""
-        lastImageAt = 0
         latestHostedUrl = nil
         latestHostedStatus = nil
-        currentStatus = "正在创建配对码…"; updateMenu()
-        var request = URLRequest(url: URL(string: "\(origin)/api/session")!)
-        request.httpMethod = "POST"
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                guard let data, error == nil, let response = try? JSONDecoder().decode(SessionResponse.self, from: data) else {
-                    self.currentStatus = "服务连接失败"; self.updateMenu(); return
-                }
-                self.code = response.code; self.currentStatus = "等待手机发送"; self.updateMenu(); self.showWindow()
-                self.timer?.invalidate()
-                self.timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.poll() }
-                self.poll()
-            }
-        }.resume()
+        receiver.start()
     }
 
-    private func poll() {
-        guard !code.isEmpty, !requestInFlight else { return }
-        requestInFlight = true
-        let url = URL(string: "\(origin)/api/room/\(code)/latest")!
-        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
-            DispatchQueue.main.async {
-                guard let self else { return }; self.requestInFlight = false
-                guard let data, let response = try? JSONDecoder().decode(LatestResponse.self, from: data), let image = response.image else { return }
-                if image.at > self.lastImageAt {
-                    self.lastImageAt = image.at; self.copy(image)
-                } else if image.hostedStatus != self.latestHostedStatus {
-                    self.latestHostedStatus = image.hostedStatus
-                    self.latestHostedUrl = image.hostedUrl
-                    self.currentStatus = image.hostedStatus == "completed" ? "已复制 · 图床归档完成" : (image.hostedStatus == "failed" ? "已复制 · 图床归档失败" : "已复制 · 图床归档中…")
-                    self.updateMenu()
-                }
-            }
-        }.resume()
-    }
-
-    private func copy(_ image: ImagePayload) {
-        guard let raw = Data(base64Encoded: image.data), let nsImage = NSImage(data: raw) else { currentStatus = "图片解析失败"; updateMenu(); return }
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents(); pasteboard.writeObjects([nsImage])
-        latestHostedUrl = image.hostedUrl
-        latestHostedStatus = image.hostedStatus
-        currentStatus = statusText(for: image); updateMenu()
-        sendNotification(size: image.size)
-    }
-
-    private func statusText(for image: ImagePayload) -> String {
+    private func statusText(for image: RelayImage) -> String {
         switch image.hostedStatus {
         case "completed": return "已自动复制 · 图床归档完成"
         case "pending": return "已自动复制 · 图床归档中…"
@@ -193,12 +170,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let plist = directory.appendingPathComponent("com.emptydust.pocketclipboard.plist")
         guard let executable = Bundle.main.executablePath else { return }
-        let content = """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0"><dict><key>Label</key><string>com.emptydust.pocketclipboard</string><key>ProgramArguments</key><array><string>\(executable)</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>
-        """
-        try? content.write(to: plist, atomically: true, encoding: .utf8)
+        // Preserve an existing login-start preference while disabling restart-on-exit.
+        let existing = try? Data(contentsOf: plist)
+        var settings = existing.flatMap { try? PropertyListSerialization.propertyList(from: $0, format: nil) as? [String: Any] } ?? [:]
+        settings["Label"] = "com.emptydust.pocketclipboard"
+        settings["ProgramArguments"] = [executable]
+        if settings["RunAtLoad"] == nil { settings["RunAtLoad"] = true }
+        settings["KeepAlive"] = false
+        if let data = try? PropertyListSerialization.data(fromPropertyList: settings, format: .xml, options: 0) {
+            try? data.write(to: plist, options: .atomic)
+        }
     }
 }
 
@@ -220,11 +201,11 @@ final class ReceiverView: NSView {
         let title = NSTextField(labelWithString: "Pocket Clipboard"); title.font = .systemFont(ofSize: 20, weight: .semibold); title.alignment = .center
         let stack = NSStackView(views: [title, codeLabel, statusLabel, refreshCodeButton, linkLabel, copyLinkButton]); stack.orientation = .vertical; stack.spacing = 10; stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack); NSLayoutConstraint.activate([stack.centerXAnchor.constraint(equalTo: centerXAnchor), stack.centerYAnchor.constraint(equalTo: centerYAnchor), stack.widthAnchor.constraint(equalTo: widthAnchor, constant: -40)])
-        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.refresh() }
+        refresh()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    private func refresh() {
+    func refresh() {
         guard let delegate else { return }
         codeLabel.stringValue = delegate.code.isEmpty ? "生成中…" : delegate.code
         statusLabel.stringValue = delegate.currentStatus
@@ -232,8 +213,3 @@ final class ReceiverView: NSView {
         copyLinkButton.isEnabled = delegate.latestHostedUrl != nil
     }
 }
-
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
